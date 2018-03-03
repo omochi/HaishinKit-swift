@@ -112,7 +112,19 @@ public final class H264Encoder {
             setProperty(kVTCompressionPropertyKey_AverageBitRate, Int(bitrate) as CFTypeRef)
         }
     }
-    var profileLevel: String = kVTProfileLevel_H264_Baseline_3_1 as String {
+    @objc var dataRateLimits: [Int] = H264Encoder.defaultDataRateLimits {
+        didSet {
+            guard dataRateLimits != oldValue else {
+                return
+            }
+            if dataRateLimits == H264Encoder.defaultDataRateLimits {
+                invalidateSession = true
+                return
+            }
+            setProperty(kVTCompressionPropertyKey_DataRateLimits, dataRateLimits as CFTypeRef)
+        }
+    }
+    @objc var profileLevel: String = kVTProfileLevel_H264_Baseline_3_1 as String {
         didSet {
             guard profileLevel != oldValue else {
                 return
@@ -123,6 +135,14 @@ public final class H264Encoder {
     var maxKeyFrameIntervalDuration: Double = 2.0 {
         didSet {
             guard maxKeyFrameIntervalDuration != oldValue else {
+                return
+            }
+            setProperty(kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, NSNumber(value: maxKeyFrameIntervalDuration))
+        }
+    }
+    @objc var canPerformMultiPasses: Bool = true {
+        didSet {
+            guard canPerformMultiPasses != oldValue else {
                 return
             }
             invalidateSession = true
@@ -199,8 +219,21 @@ public final class H264Encoder {
         }
         let encoder: H264Encoder = Unmanaged<H264Encoder>.fromOpaque(refcon).takeUnretainedValue()
         encoder.formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer)
-        encoder.delegate?.sampleOutput(video: sampleBuffer)
+        if encoder.canPerformMultiPasses {
+            encoder.performMultiPasses(sampleBuffer)
+        } else {
+            encoder.delegate?.sampleOutput(video: sampleBuffer)
+        }
     }
+
+    private var storage: VTMultiPassStorage? {
+        didSet {
+            if let oldValue: VTMultiPassStorage = oldValue {
+                VTMultiPassStorageClose(oldValue)
+            }
+        }
+    }
+    private var frameSilo: VTFrameSilo?
 
     private var _session: VTCompressionSession?
     private var session: VTCompressionSession? {
@@ -222,8 +255,19 @@ public final class H264Encoder {
                     return nil
                 }
                 invalidateSession = false
-                status = VTSessionSetProperties(_session!, propertyDictionary: properties as CFDictionary)
+                supportedProperty = _session?.copySupportedPropertyDictionary()
+                if canPerformMultiPasses {
+                    status = VTMultiPassStorageCreate(kCFAllocatorDefault, nil, kCMTimeRangeInvalid, nil, &storage)
+                    if let storage: VTMultiPassStorage = storage {
+                        VTSessionSetProperty(_session!, kVTCompressionPropertyKey_MultiPassStorage, storage)
+                    }
+                    status = VTFrameSiloCreate(kCFAllocatorDefault, nil, kCMTimeRangeInvalid, nil, &frameSilo)
+                }
+                status = VTSessionSetProperties(_session!, properties as CFDictionary)
                 status = VTCompressionSessionPrepareToEncodeFrames(_session!)
+                if canPerformMultiPasses {
+                    status = VTCompressionSessionBeginPass(_session!, VTCompressionSessionOptionFlags.beginFinalPass, nil)
+                }
             }
             return _session
         }
@@ -235,20 +279,39 @@ public final class H264Encoder {
         }
     }
 
-    init() {
-        settings.observer = self
-    }
+    private var beginPassTime = kCMTimeInvalid
 
     func encodeImageBuffer(_ imageBuffer: CVImageBuffer, presentationTimeStamp: CMTime, duration: CMTime) {
         guard isRunning.value && locked == 0 else {
             return
         }
         if invalidateSession {
+            frameSilo = nil
+            storage = nil
             session = nil
         }
+
         guard let session: VTCompressionSession = session else {
             return
         }
+
+        if canPerformMultiPasses {
+            if let frameSilo = frameSilo, let timeRange = timeRange(presentationTimeStamp) {
+                VTCompressionSessionEndPass(session, nil, nil)
+                print("=====================\(timeRange)")
+                VTFrameSiloCallBlockForEachSampleBuffer(frameSilo, timeRange) { (sampleBuffer) -> OSStatus in
+                    print(sampleBuffer.presentationTimeStamp)
+                    return noErr
+                }
+                VTCompressionSessionBeginPass(session, VTCompressionSessionOptionFlags(rawValue: 0), nil)
+                //beginPassTime = presentationTimeStamp
+            }
+            if beginPassTime == kCMTimeInvalid {
+                beginPassTime = presentationTimeStamp
+                VTCompressionSessionBeginPass(session, VTCompressionSessionOptionFlags(rawValue: 0), nil)
+            }
+        }
+
         var flags: VTEncodeInfoFlags = []
         VTCompressionSessionEncodeFrame(
             session,
@@ -259,9 +322,27 @@ public final class H264Encoder {
             sourceFrameRefcon: nil,
             infoFlagsOut: &flags
         )
+
         if !muted {
             lastImageBuffer = imageBuffer
         }
+    }
+
+    func performMultiPasses(_ sampleBuffer: CMSampleBuffer) {
+        guard let frameSilo = self.frameSilo else {
+            return
+        }
+        VTFrameSiloAddSampleBuffer(frameSilo, sampleBuffer)
+    }
+
+    private func timeRange(_ timestamp: CMTime) -> CMTimeRange? {
+        if beginPassTime == kCMTimeInvalid {
+            return nil
+        }
+        if 0.2 < (timestamp.seconds - beginPassTime.seconds) {
+            return CMTimeRange(start: beginPassTime, end: timestamp)
+        }
+        return nil
     }
 
     private func setProperty(_ key: CFString, _ value: CFTypeRef?) {
@@ -325,6 +406,8 @@ extension H264Encoder: Running {
 
     public func stopRunning() {
         lockQueue.async {
+            self.storage = nil
+            self.frameSilo = nil
             self.session = nil
             self.lastImageBuffer = nil
             self.formatDescription = nil
